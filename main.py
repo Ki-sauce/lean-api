@@ -53,7 +53,7 @@ def check(req: CheckRequest):
             path = f.name
 
         result = subprocess.run(
-            ["lake", "env", "lean", path],
+            ["lake", "lean", path],
             cwd=LEAN_PROJECT,
             capture_output=True,
             text=True,
