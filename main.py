@@ -24,7 +24,7 @@ def check(req: CheckRequest):
 
     try:
         result = subprocess.run(
-            ["lean", path],
+            ["lake", "env", "lean", path],
             capture_output=True,
             text=True,
             timeout=60,
@@ -44,3 +44,16 @@ def check(req: CheckRequest):
 
     finally:
         os.unlink(path)
+
+@app.get("/health")
+def health():
+    result = subprocess.run(
+        ["lake", "env", "lean", "--version"],
+        capture_output=True,
+        text=True,
+    )
+
+    return {
+        "lean": result.stdout.strip(),
+        "stderr": result.stderr,
+    }

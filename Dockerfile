@@ -1,23 +1,14 @@
-FROM python:3.12-slim
+FROM ghcr.io/leanprover-community/mathlib4/lean:2026-08-30
 
 WORKDIR /app
 
+# Python
 RUN apt-get update && \
-    apt-get install -y curl git ca-certificates && \
+    apt-get install -y python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# Install elan
-RUN curl https://elan.lean-lang.org/elan-init.sh -sSf | \
-    sh -s -- -y --default-toolchain none
-
-ENV PATH="/root/.elan/bin:$PATH"
-
-# Actually install Lean during the Docker build
-RUN elan toolchain install stable
-RUN elan default stable
-
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY main.py .
 
