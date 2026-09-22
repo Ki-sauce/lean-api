@@ -39,27 +39,48 @@ def lean_env():
 
 @app.get("/health")
 def health():
-    try:
-        result = subprocess.run(
-            ["lean", "--version"],
-            cwd=LEAN_PROJECT,
-            env=lean_env(),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+    checks = {}
 
-        return {
-            "success": result.returncode == 0,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
+    commands = [
+        ("lean", ["lean", "--version"]),
+        ("lake", ["lake", "--version"]),
+    ]
 
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "error": "lean --version timed out",
-        }
+    for name, command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=LEAN_PROJECT,
+                env=lean_env(),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            checks[name] = {
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+
+        except subprocess.TimeoutExpired:
+            checks[name] = {
+                "timeout": True,
+            }
+
+    mathlib_olean = (
+        f"{LEAN_PROJECT}/.lake/packages/mathlib/"
+        ".lake/build/lib/lean/Mathlib.olean"
+    )
+
+    checks["mathlib"] = {
+        "Mathlib.olean_exists": os.path.exists(mathlib_olean),
+        "path": mathlib_olean,
+    }
+
+    checks["lean_path"] = lean_env().get("LEAN_PATH", "").split(":")
+
+    return checks
 
 
 @app.post("/check")
