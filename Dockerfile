@@ -28,6 +28,7 @@ WORKDIR /app/leanverify
 # Fetch dependencies and precompiled Mathlib artifacts
 RUN lake update
 RUN lake exe cache get
+RUN lake build Mathlib
 
 WORKDIR /app
 
