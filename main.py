@@ -1,3 +1,4 @@
+import glob
 import os
 import subprocess
 import tempfile
@@ -14,12 +15,35 @@ class CheckRequest(BaseModel):
     source: str
 
 
+def lean_env():
+    env = os.environ.copy()
+
+    paths = [
+        f"{LEAN_PROJECT}/.lake/build/lib/lean"
+    ]
+
+    # Mathlib and its dependencies
+    paths += glob.glob(
+        f"{LEAN_PROJECT}/.lake/packages/*/.lake/build/lib/lean"
+    )
+
+    # Preserve anything already supplied by the environment.
+    existing = env.get("LEAN_PATH")
+    if existing:
+        paths.append(existing)
+
+    env["LEAN_PATH"] = ":".join(paths)
+
+    return env
+
+
 @app.get("/health")
 def health():
     try:
         result = subprocess.run(
             ["lean", "--version"],
             cwd=LEAN_PROJECT,
+            env=lean_env(),
             capture_output=True,
             text=True,
             timeout=10,
@@ -52,12 +76,15 @@ def check(req: CheckRequest):
             f.write(req.source)
             path = f.name
 
+        # IMPORTANT:
+        # Invoke Lean directly. Do not invoke lake.
         result = subprocess.run(
-            ["lake", "lean", path],
+            ["lean", path],
             cwd=LEAN_PROJECT,
+            env=lean_env(),
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=30,
         )
 
         return {
