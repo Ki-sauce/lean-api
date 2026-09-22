@@ -16,12 +16,16 @@ RUN curl https://elan.lean-lang.org/elan-init.sh -sSf | \
 
 ENV PATH="/root/.elan/bin:$PATH"
 
-# Create a Lean project that depends on Mathlib
+# Install Lean
+RUN elan toolchain install stable
+RUN elan default stable
+
+# Create Lean + Mathlib project
 RUN lake init leanverify math
 
 WORKDIR /app/leanverify
 
-# Download the Lean toolchain and Mathlib
+# Fetch Mathlib and its precompiled artifacts
 RUN lake update
 RUN lake exe cache get
 
