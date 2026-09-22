@@ -20,12 +20,12 @@ ENV PATH="/root/.elan/bin:$PATH"
 RUN elan toolchain install stable
 RUN elan default stable
 
-# Create Lean + Mathlib project
-RUN lake init leanverify math
+# Create a Lean project with Mathlib
+RUN lake new leanverify math
 
 WORKDIR /app/leanverify
 
-# Fetch Mathlib and its precompiled artifacts
+# Fetch dependencies and precompiled Mathlib artifacts
 RUN lake update
 RUN lake exe cache get
 
