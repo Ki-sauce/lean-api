@@ -28,6 +28,7 @@ def check(req: CheckRequest):
             capture_output=True,
             text=True,
             timeout=60,
+            cwd="/app/leanverify",
         )
 
         return {
@@ -44,16 +45,3 @@ def check(req: CheckRequest):
 
     finally:
         os.unlink(path)
-
-@app.get("/health")
-def health():
-    result = subprocess.run(
-        ["lake", "env", "lean", "--version"],
-        capture_output=True,
-        text=True,
-    )
-
-    return {
-        "lean": result.stdout.strip(),
-        "stderr": result.stderr,
-    }
