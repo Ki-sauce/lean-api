@@ -27,7 +27,7 @@ def check(req: CheckRequest):
             ["lean", path],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=60,
         )
 
         return {
