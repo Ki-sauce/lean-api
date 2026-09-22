@@ -18,6 +18,7 @@ def check(req: CheckRequest):
         mode="w",
         suffix=".lean",
         delete=False,
+        dir="/app/leanverify",
     ) as f:
         f.write(req.source)
         path = f.name
@@ -25,10 +26,10 @@ def check(req: CheckRequest):
     try:
         result = subprocess.run(
             ["lake", "env", "lean", path],
+            cwd="/app/leanverify",
             capture_output=True,
             text=True,
             timeout=60,
-            cwd="/app/leanverify",
         )
 
         return {
