@@ -358,3 +358,38 @@ theorem leanverify_health_test : (8 : Nat) + 1 = 2 := rfl
         }
 
     return result
+
+@app.get("/benchmark")
+def benchmark():
+    tests = {
+        "bare": """
+theorem test : 1 + 1 = 2 := rfl
+""",
+        "real_basic": """
+import Mathlib.Data.Real.Basic
+
+theorem test : (1 : ℝ) + 1 = 2 := by
+  norm_num
+""",
+        "mathlib": """
+import Mathlib
+
+theorem test : (1 : ℝ) + 1 = 2 := by
+  norm_num
+""",
+    }
+
+    results = {}
+
+    for name, source in tests.items():
+        start = time.perf_counter()
+
+        result = verify_source(source, timeout=120)
+
+        results[name] = {
+            "elapsed_seconds": round(time.perf_counter() - start, 3),
+            "success": result["success"],
+            "exit_code": result["exit_code"],
+        }
+
+    return results
