@@ -14,6 +14,9 @@ app = FastAPI()
 
 LEAN_PROJECT = "/app/leanverify"
 
+lean_server = None
+lean_server_lock = threading.Lock()
+
 
 class CheckRequest(BaseModel):
     source: str
@@ -40,19 +43,24 @@ def lean_env():
 
 
 class LeanServer:
+
     def __init__(self):
         self.process = None
-        self.responses = {}
-        self.diagnostics = {}
 
+        self.responses = {}
         self.response_condition = threading.Condition()
+
         self.write_lock = threading.Lock()
+
+        self.diagnostics = {}
 
         self.reader_error = None
 
         self._start()
 
     def _start(self):
+        print("[lean] starting server", flush=True)
+
         self.process = subprocess.Popen(
             ["lean", "--server"],
             cwd=LEAN_PROJECT,
@@ -61,6 +69,11 @@ class LeanServer:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+        )
+
+        print(
+            f"[lean] pid={self.process.pid}",
+            flush=True,
         )
 
         threading.Thread(
@@ -73,7 +86,12 @@ class LeanServer:
             daemon=True,
         ).start()
 
-        self._request(
+        print(
+            "[lean] sending initialize",
+            flush=True,
+        )
+
+        result = self._request(
             1,
             "initialize",
             {
@@ -82,13 +100,29 @@ class LeanServer:
                     "name": "lean-api",
                     "version": "1.0",
                 },
-                "rootUri": Path(LEAN_PROJECT).resolve().as_uri(),
+                "rootUri": Path(
+                    LEAN_PROJECT
+                ).resolve().as_uri(),
                 "capabilities": {},
             },
             timeout=30,
         )
 
-        self._notify("initialized", {})
+        print(
+            "[lean] initialize response:",
+            json.dumps(result),
+            flush=True,
+        )
+
+        self._notify(
+            "initialized",
+            {},
+        )
+
+        print(
+            "[lean] initialized",
+            flush=True,
+        )
 
     def _send(self, message):
         body = json.dumps(
@@ -98,8 +132,14 @@ class LeanServer:
 
         header = (
             f"Content-Length: {len(body)}\r\n"
-            "\r\n"
+            f"\r\n"
         ).encode("ascii")
+
+        print(
+            "[LSP ->]",
+            json.dumps(message),
+            flush=True,
+        )
 
         with self.write_lock:
             self.process.stdin.write(header)
@@ -113,28 +153,44 @@ class LeanServer:
             "params": params,
         })
 
-    def _request(self, request_id, method, params, timeout=30):
-        self._send({
+    def _request(
+        self,
+        request_id,
+        method,
+        params,
+        timeout=30,
+    ):
+        message = {
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
             "params": params,
-        })
+        }
+
+        self._send(message)
 
         deadline = time.monotonic() + timeout
 
         with self.response_condition:
+
             while request_id not in self.responses:
-                remaining = deadline - time.monotonic()
+
+                remaining = (
+                    deadline - time.monotonic()
+                )
 
                 if remaining <= 0:
                     raise TimeoutError(
-                        f"Lean server request timed out: {method}"
+                        f"timeout waiting for {method}"
                     )
 
-                self.response_condition.wait(remaining)
+                self.response_condition.wait(
+                    remaining
+                )
 
-            return self.responses.pop(request_id)
+            return self.responses.pop(
+                request_id
+            )
 
     def _read_message(self):
         headers = {}
@@ -145,66 +201,99 @@ class LeanServer:
             if not line:
                 return None
 
-            line = line.decode("ascii").rstrip("\r\n")
+            line = line.decode(
+                "ascii",
+                errors="replace",
+            ).rstrip("\r\n")
 
             if not line:
                 break
 
-            key, value = line.split(":", 1)
+            key, value = line.split(
+                ":",
+                1,
+            )
+
             headers[key.lower()] = value.strip()
 
         if "content-length" not in headers:
             raise RuntimeError(
-                f"Missing Content-Length: {headers}"
+                f"missing Content-Length: {headers}"
             )
 
-        length = int(headers["content-length"])
+        length = int(
+            headers["content-length"]
+        )
 
-        body = self.process.stdout.read(length)
+        body = self.process.stdout.read(
+            length
+        )
 
         if not body:
             return None
 
-        return json.loads(body.decode("utf-8"))
+        return json.loads(
+            body.decode("utf-8")
+        )
 
     def _read_loop(self):
         try:
             while True:
+
                 message = self._read_message()
 
                 if message is None:
+                    print(
+                        "[LSP <-] EOF",
+                        flush=True,
+                    )
                     return
 
-                # Response to a request we sent.
-                if "id" in message and (
-                    "result" in message
-                    or "error" in message
+                print(
+                    "[LSP <-]",
+                    json.dumps(message),
+                    flush=True,
+                )
+
+                # Response to one of our requests.
+                if (
+                    "id" in message
+                    and (
+                        "result" in message
+                        or "error" in message
+                    )
                 ):
+
                     with self.response_condition:
-                        self.responses[message["id"]] = message
+                        self.responses[
+                            message["id"]
+                        ] = message
+
                         self.response_condition.notify_all()
 
                     continue
 
-                # Request originating from Lean.
+                # Server -> client request.
                 if (
                     "id" in message
                     and "method" in message
                 ):
+
+                    request_id = message["id"]
                     method = message["method"]
 
-                    # We don't need any client-side capabilities
-                    # for this verifier.
-                    self._send({
-                        "jsonrpc": "2.0",
-                        "id": message["id"],
-                        "result": None,
-                    })
-
                     print(
-                        f"[lean-server] handled request: {method}",
+                        "[LSP] server request:",
+                        method,
                         flush=True,
                     )
+
+                    # For now, acknowledge it.
+                    self._send({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": None,
+                    })
 
                     continue
 
@@ -213,303 +302,245 @@ class LeanServer:
                     message.get("method")
                     == "textDocument/publishDiagnostics"
                 ):
-                    params = message.get("params", {})
-                    uri = params.get("uri")
 
-                    self.diagnostics[uri] = params.get(
-                        "diagnostics",
-                        [],
+                    params = message.get(
+                        "params",
+                        {},
+                    )
+
+                    uri = params.get(
+                        "uri"
+                    )
+
+                    self.diagnostics[uri] = (
+                        params.get(
+                            "diagnostics",
+                            [],
+                        )
+                    )
+
+                    print(
+                        "[LSP] diagnostics:",
+                        len(
+                            self.diagnostics[uri]
+                        ),
+                        flush=True,
                     )
 
                     continue
 
         except Exception as e:
+
             self.reader_error = repr(e)
 
             print(
-                "[lean-reader-error]",
+                "[LSP reader error]",
                 repr(e),
                 flush=True,
             )
 
     def _stderr_loop(self):
         while True:
+
             line = self.process.stderr.readline()
 
             if not line:
                 return
 
             print(
-                "[lean]",
-                line.decode(errors="replace").rstrip(),
+                "[lean stderr]",
+                line.decode(
+                    errors="replace"
+                ).rstrip(),
                 flush=True,
             )
 
-    def check(self, source, timeout=30):
+    def debug_hover(self):
+        source = """theorem test : 1 + 1 = 2 := by
+  norm_num
+"""
+
         filename = os.path.join(
             LEAN_PROJECT,
-            f"_health_{time.time_ns()}.lean",
+            "_debug.lean",
         )
 
-        uri = Path(filename).resolve().as_uri()
+        uri = Path(
+            filename
+        ).resolve().as_uri()
 
-        try:
-            with open(filename, "w") as f:
-                f.write(source)
+        with open(filename, "w") as f:
+            f.write(source)
 
-            self.diagnostics.pop(uri, None)
-
-            self._notify(
-                "textDocument/didOpen",
-                {
-                    "textDocument": {
-                        "uri": uri,
-                        "languageId": "lean",
-                        "version": 1,
-                        "text": source,
-                    }
-                },
-            )
-
-            request_id = time.time_ns()
-
-            started = time.monotonic()
-
-            result = self._request(
-                request_id,
-                "textDocument/waitForDiagnostics",
-                {
+        self._notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
                     "uri": uri,
+                    "languageId": "lean",
                     "version": 1,
+                    "text": source,
+                }
+            },
+        )
+
+        # Ask for hover over "test".
+        request_id = 100
+
+        result = self._request(
+            request_id,
+            "textDocument/hover",
+            {
+                "textDocument": {
+                    "uri": uri,
                 },
-                timeout=timeout,
-            )
+                "position": {
+                    "line": 0,
+                    "character": 9,
+                },
+            },
+            timeout=30,
+        )
 
-            elapsed = time.monotonic() - started
-
-            diagnostics = self.diagnostics.get(uri, [])
-
-            errors = [
-                d for d in diagnostics
-                if d.get("severity") == 1
-            ]
-
-            return {
-                "success": len(errors) == 0,
-                "elapsed_seconds": round(elapsed, 3),
-                "diagnostics": diagnostics,
-                "server_response": result,
-            }
-
-        finally:
-            try:
-                self._notify(
-                    "textDocument/didClose",
-                    {
-                        "textDocument": {
-                            "uri": uri,
-                        }
-                    },
-                )
-            except Exception:
-                pass
-
-            try:
-                os.remove(filename)
-            except FileNotFoundError:
-                pass
+        return result
 
 
-lean_server = None
-
-
-@app.on_event("startup")
-def startup():
+def get_lean_server():
     global lean_server
 
+    if lean_server is not None:
+        return lean_server
+
+    with lean_server_lock:
+
+        if lean_server is None:
+            lean_server = LeanServer()
+
+    return lean_server
+
+
+@app.get("/health")
+def health():
+
+    mathlib = Path(
+        f"{LEAN_PROJECT}/.lake/packages/mathlib/"
+        ".lake/build/lib/lean/Mathlib.olean"
+    )
+
+    return {
+        "status": "ok",
+
+        "lean": {
+            "ok": subprocess.run(
+                ["lean", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).returncode == 0,
+        },
+
+        "lake": {
+            "ok": subprocess.run(
+                ["lake", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).returncode == 0,
+        },
+
+        "mathlib": {
+            "exists": mathlib.exists(),
+            "size_mb": (
+                round(
+                    mathlib.stat().st_size
+                    / 1024
+                    / 1024,
+                    2,
+                )
+                if mathlib.exists()
+                else None
+            ),
+        },
+
+        "server": {
+            "created": lean_server is not None,
+
+            "alive": (
+                lean_server is not None
+                and lean_server.process is not None
+                and lean_server.process.poll() is None
+            ),
+
+            "pid": (
+                lean_server.process.pid
+                if (
+                    lean_server is not None
+                    and lean_server.process is not None
+                )
+                else None
+            ),
+
+            "reader_error": (
+                lean_server.reader_error
+                if lean_server is not None
+                else None
+            ),
+        },
+    }
+
+
+@app.get("/debug-lsp")
+def debug_lsp():
+
+    server = get_lean_server()
+
+    start = time.monotonic()
+
     try:
-        lean_server = LeanServer()
-    except Exception as e:
-        print(
-            "[startup] Lean server failed:",
-            repr(e),
-            flush=True,
-        )
-        lean_server = None
 
-
-def run_health_check(name, fn):
-    started = time.monotonic()
-
-    try:
-        result = fn()
+        result = server.debug_hover()
 
         return {
             "ok": True,
-            "elapsed_seconds": round(
-                time.monotonic() - started,
-                3,
+            "elapsed_seconds": (
+                time.monotonic() - start
             ),
             "result": result,
         }
 
     except Exception as e:
+
         return {
             "ok": False,
-            "elapsed_seconds": round(
-                time.monotonic() - started,
-                3,
+            "elapsed_seconds": (
+                time.monotonic() - start
             ),
             "error": repr(e),
+            "reader_error": server.reader_error,
+            "server_alive": (
+                server.process is not None
+                and server.process.poll() is None
+            ),
         }
-
-
-@app.get("/health")
-def health():
-    result = {}
-
-    # ------------------------------------------------------------
-    # 1. Lean executable
-    # ------------------------------------------------------------
-
-    result["lean"] = run_health_check(
-        "lean",
-        lambda: subprocess.run(
-            ["lean", "--version"],
-            cwd=LEAN_PROJECT,
-            env=lean_env(),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout.strip(),
-    )
-
-    # ------------------------------------------------------------
-    # 2. Lake
-    # ------------------------------------------------------------
-
-    result["lake"] = run_health_check(
-        "lake",
-        lambda: subprocess.run(
-            ["lake", "--version"],
-            cwd=LEAN_PROJECT,
-            env=lean_env(),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout.strip(),
-    )
-
-    # ------------------------------------------------------------
-    # 3. Mathlib artifact
-    # ------------------------------------------------------------
-
-    mathlib_olean = (
-        f"{LEAN_PROJECT}/.lake/packages/mathlib/"
-        ".lake/build/lib/lean/Mathlib.olean"
-    )
-
-    result["mathlib"] = {
-        "ok": os.path.exists(mathlib_olean),
-        "path": mathlib_olean,
-        "size_mb": (
-            round(os.path.getsize(mathlib_olean) / 1024 / 1024, 2)
-            if os.path.exists(mathlib_olean)
-            else None
-        ),
-    }
-
-    # ------------------------------------------------------------
-    # 4. LEAN_PATH
-    # ------------------------------------------------------------
-
-    env = lean_env()
-
-    result["lean_path"] = {
-        "ok": bool(env.get("LEAN_PATH")),
-        "entries": env.get("LEAN_PATH", "").split(":"),
-    }
-
-    # ------------------------------------------------------------
-    # 5. Server process
-    # ------------------------------------------------------------
-
-    result["server"] = {
-        "created": lean_server is not None,
-        "alive": (
-            lean_server is not None
-            and lean_server.process.poll() is None
-        ),
-        "pid": (
-            lean_server.process.pid
-            if lean_server is not None
-            else None
-        ),
-        "reader_error": (
-            lean_server.reader_error
-            if lean_server is not None
-            else None
-        ),
-    }
-
-    # ------------------------------------------------------------
-    # 6. Actual server theorem test
-    # ------------------------------------------------------------
-
-    if lean_server is not None:
-        result["server_trivial"] = run_health_check(
-            "server_trivial",
-            lambda: lean_server.check(
-                "example : 1 + 1 = 2 := by rfl",
-                timeout=30,
-            ),
-        )
-
-        result["server_mathlib"] = run_health_check(
-            "server_mathlib",
-            lambda: lean_server.check(
-                """import Mathlib.Data.Real.Basic
-
-example : (1 : ℝ) + 1 = 2 := by
-  norm_num
-""",
-                timeout=90,
-            ),
-        )
-
-    return result
 
 
 @app.post("/check")
-def check(req: CheckRequest):
-    if lean_server is None:
-        return {
-            "success": False,
-            "error": "Lean server not initialized",
-        }
+def check(request: CheckRequest):
 
-    if lean_server.process.poll() is not None:
-        return {
-            "success": False,
-            "error": "Lean server has exited",
-        }
+    server = get_lean_server()
 
     try:
-        return lean_server.check(
-            req.source,
-            timeout=120,
-        )
 
-    except TimeoutError as e:
-        return {
-            "success": False,
-            "error": str(e),
-        }
+        return server.debug_hover()
 
     except Exception as e:
+
         return {
             "success": False,
             "error": repr(e),
+            "reader_error": server.reader_error,
+            "server_alive": (
+                server.process is not None
+                and server.process.poll() is None
+            ),
         }
