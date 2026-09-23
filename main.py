@@ -48,6 +48,8 @@ class LeanServer:
         self.response_condition = threading.Condition()
         self.write_lock = threading.Lock()
 
+        self.reader_error = None
+
         self._start()
 
     def _start(self):
@@ -80,22 +82,13 @@ class LeanServer:
                     "name": "lean-api",
                     "version": "1.0",
                 },
-                "capabilities": {
-                    "textDocument": {
-                        "publishDiagnostics": {
-                            "relatedInformation": True
-                        }
-                    }
-                },
+                "rootUri": Path(LEAN_PROJECT).resolve().as_uri(),
+                "capabilities": {},
             },
-            timeout=120,
+            timeout=30,
         )
 
         self._notify("initialized", {})
-
-    # ------------------------------------------------------------
-    # LSP transport
-    # ------------------------------------------------------------
 
     def _send(self, message):
         body = json.dumps(
@@ -120,7 +113,7 @@ class LeanServer:
             "params": params,
         })
 
-    def _request(self, request_id, method, params, timeout=120):
+    def _request(self, request_id, method, params, timeout=30):
         self._send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -139,15 +132,9 @@ class LeanServer:
                         f"Lean server request timed out: {method}"
                     )
 
-                self.response_condition.wait(
-                    timeout=remaining
-                )
+                self.response_condition.wait(remaining)
 
             return self.responses.pop(request_id)
-
-    # ------------------------------------------------------------
-    # LSP reader
-    # ------------------------------------------------------------
 
     def _read_message(self):
         headers = {}
@@ -166,6 +153,11 @@ class LeanServer:
             key, value = line.split(":", 1)
             headers[key.lower()] = value.strip()
 
+        if "content-length" not in headers:
+            raise RuntimeError(
+                f"Missing Content-Length: {headers}"
+            )
+
         length = int(headers["content-length"])
 
         body = self.process.stdout.read(length)
@@ -176,14 +168,14 @@ class LeanServer:
         return json.loads(body.decode("utf-8"))
 
     def _read_loop(self):
-        while True:
-            try:
+        try:
+            while True:
                 message = self._read_message()
 
                 if message is None:
                     return
 
-                # Response to one of our requests.
+                # Response to a request we sent.
                 if "id" in message and (
                     "result" in message
                     or "error" in message
@@ -195,19 +187,24 @@ class LeanServer:
                     continue
 
                 # Request originating from Lean.
-                #
-                # Lean can ask the client to register capabilities,
-                # refresh things, etc. We don't need those capabilities,
-                # but we must answer the JSON-RPC request.
                 if (
                     "id" in message
                     and "method" in message
                 ):
+                    method = message["method"]
+
+                    # We don't need any client-side capabilities
+                    # for this verifier.
                     self._send({
                         "jsonrpc": "2.0",
                         "id": message["id"],
                         "result": None,
                     })
+
+                    print(
+                        f"[lean-server] handled request: {method}",
+                        flush=True,
+                    )
 
                     continue
 
@@ -219,22 +216,21 @@ class LeanServer:
                     params = message.get("params", {})
                     uri = params.get("uri")
 
-                    diagnostics = params.get(
+                    self.diagnostics[uri] = params.get(
                         "diagnostics",
                         [],
                     )
 
-                    self.diagnostics[uri] = diagnostics
-
                     continue
 
-            except Exception as e:
-                print(
-                    "[lean-reader]",
-                    repr(e),
-                    flush=True,
-                )
-                return
+        except Exception as e:
+            self.reader_error = repr(e)
+
+            print(
+                "[lean-reader-error]",
+                repr(e),
+                flush=True,
+            )
 
     def _stderr_loop(self):
         while True:
@@ -249,19 +245,13 @@ class LeanServer:
                 flush=True,
             )
 
-    # ------------------------------------------------------------
-    # Lean checking
-    # ------------------------------------------------------------
-
-    def check(self, source):
+    def check(self, source, timeout=30):
         filename = os.path.join(
             LEAN_PROJECT,
-            f"_check_{time.time_ns()}.lean",
+            f"_health_{time.time_ns()}.lean",
         )
 
         uri = Path(filename).resolve().as_uri()
-
-        version = 1
 
         try:
             with open(filename, "w") as f:
@@ -275,7 +265,7 @@ class LeanServer:
                     "textDocument": {
                         "uri": uri,
                         "languageId": "lean",
-                        "version": version,
+                        "version": 1,
                         "text": source,
                     }
                 },
@@ -283,38 +273,32 @@ class LeanServer:
 
             request_id = time.time_ns()
 
-            self._request(
+            started = time.monotonic()
+
+            result = self._request(
                 request_id,
                 "textDocument/waitForDiagnostics",
                 {
                     "uri": uri,
-                    "version": version,
+                    "version": 1,
                 },
-                timeout=120,
+                timeout=timeout,
             )
 
-            diagnostics = self.diagnostics.get(
-                uri,
-                [],
-            )
+            elapsed = time.monotonic() - started
+
+            diagnostics = self.diagnostics.get(uri, [])
 
             errors = [
-                d
-                for d in diagnostics
+                d for d in diagnostics
                 if d.get("severity") == 1
-            ]
-
-            warnings = [
-                d
-                for d in diagnostics
-                if d.get("severity") != 1
             ]
 
             return {
                 "success": len(errors) == 0,
+                "elapsed_seconds": round(elapsed, 3),
                 "diagnostics": diagnostics,
-                "errors": errors,
-                "warnings": warnings,
+                "server_response": result,
             }
 
         finally:
@@ -342,38 +326,158 @@ lean_server = None
 @app.on_event("startup")
 def startup():
     global lean_server
-    lean_server = LeanServer()
+
+    try:
+        lean_server = LeanServer()
+    except Exception as e:
+        print(
+            "[startup] Lean server failed:",
+            repr(e),
+            flush=True,
+        )
+        lean_server = None
+
+
+def run_health_check(name, fn):
+    started = time.monotonic()
+
+    try:
+        result = fn()
+
+        return {
+            "ok": True,
+            "elapsed_seconds": round(
+                time.monotonic() - started,
+                3,
+            ),
+            "result": result,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "elapsed_seconds": round(
+                time.monotonic() - started,
+                3,
+            ),
+            "error": repr(e),
+        }
 
 
 @app.get("/health")
 def health():
     result = {}
 
-    try:
-        lean = subprocess.run(
+    # ------------------------------------------------------------
+    # 1. Lean executable
+    # ------------------------------------------------------------
+
+    result["lean"] = run_health_check(
+        "lean",
+        lambda: subprocess.run(
             ["lean", "--version"],
             cwd=LEAN_PROJECT,
             env=lean_env(),
             capture_output=True,
             text=True,
             timeout=10,
+            check=True,
+        ).stdout.strip(),
+    )
+
+    # ------------------------------------------------------------
+    # 2. Lake
+    # ------------------------------------------------------------
+
+    result["lake"] = run_health_check(
+        "lake",
+        lambda: subprocess.run(
+            ["lake", "--version"],
+            cwd=LEAN_PROJECT,
+            env=lean_env(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip(),
+    )
+
+    # ------------------------------------------------------------
+    # 3. Mathlib artifact
+    # ------------------------------------------------------------
+
+    mathlib_olean = (
+        f"{LEAN_PROJECT}/.lake/packages/mathlib/"
+        ".lake/build/lib/lean/Mathlib.olean"
+    )
+
+    result["mathlib"] = {
+        "ok": os.path.exists(mathlib_olean),
+        "path": mathlib_olean,
+        "size_mb": (
+            round(os.path.getsize(mathlib_olean) / 1024 / 1024, 2)
+            if os.path.exists(mathlib_olean)
+            else None
+        ),
+    }
+
+    # ------------------------------------------------------------
+    # 4. LEAN_PATH
+    # ------------------------------------------------------------
+
+    env = lean_env()
+
+    result["lean_path"] = {
+        "ok": bool(env.get("LEAN_PATH")),
+        "entries": env.get("LEAN_PATH", "").split(":"),
+    }
+
+    # ------------------------------------------------------------
+    # 5. Server process
+    # ------------------------------------------------------------
+
+    result["server"] = {
+        "created": lean_server is not None,
+        "alive": (
+            lean_server is not None
+            and lean_server.process.poll() is None
+        ),
+        "pid": (
+            lean_server.process.pid
+            if lean_server is not None
+            else None
+        ),
+        "reader_error": (
+            lean_server.reader_error
+            if lean_server is not None
+            else None
+        ),
+    }
+
+    # ------------------------------------------------------------
+    # 6. Actual server theorem test
+    # ------------------------------------------------------------
+
+    if lean_server is not None:
+        result["server_trivial"] = run_health_check(
+            "server_trivial",
+            lambda: lean_server.check(
+                "example : 1 + 1 = 2 := by rfl",
+                timeout=30,
+            ),
         )
 
-        result["lean"] = {
-            "returncode": lean.returncode,
-            "stdout": lean.stdout,
-            "stderr": lean.stderr,
-        }
+        result["server_mathlib"] = run_health_check(
+            "server_mathlib",
+            lambda: lean_server.check(
+                """import Mathlib.Data.Real.Basic
 
-    except Exception as e:
-        result["lean"] = {
-            "error": str(e),
-        }
-
-    result["server_alive"] = (
-        lean_server is not None
-        and lean_server.process.poll() is None
-    )
+example : (1 : ℝ) + 1 = 2 := by
+  norm_num
+""",
+                timeout=90,
+            ),
+        )
 
     return result
 
@@ -393,7 +497,10 @@ def check(req: CheckRequest):
         }
 
     try:
-        return lean_server.check(req.source)
+        return lean_server.check(
+            req.source,
+            timeout=120,
+        )
 
     except TimeoutError as e:
         return {
