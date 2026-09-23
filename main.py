@@ -17,6 +17,53 @@ from pydantic import BaseModel
 LEAN_PROJECT = Path("/app/leanverify")
 CHECK_TIMEOUT = 90
 
+def verify_source(source: str, timeout: int = 90) -> dict:
+    start = time.perf_counter()
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".lean",
+        prefix="_verify_",
+        dir=LEAN_PROJECT,
+        delete=False,
+        encoding="utf-8",
+    ) as f:
+        path = Path(f.name)
+        f.write(source)
+
+    try:
+        process = subprocess.run(
+            ["lean", str(path)],
+            cwd=LEAN_PROJECT,
+            env=lean_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+        diagnostics = "\n".join(
+            x for x in [process.stdout, process.stderr] if x
+        ).strip()
+
+        return {
+            "success": process.returncode == 0,
+            "exit_code": process.returncode,
+            "elapsed_seconds": round(time.perf_counter() - start, 3),
+            "diagnostics": diagnostics,
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "exit_code": None,
+            "elapsed_seconds": round(time.perf_counter() - start, 3),
+            "error": "Lean process timed out",
+            "diagnostics": "",
+        }
+
+    finally:
+        path.unlink(missing_ok=True)
+
 
 def lean_env() -> dict[str, str]:
     env = os.environ.copy()
