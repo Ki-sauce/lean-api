@@ -10,26 +10,25 @@ RUN apt-get update && \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install elan without selecting an arbitrary Lean version
+# Install elan
 RUN curl https://elan.lean-lang.org/elan-init.sh -sSf | \
     sh -s -- -y --default-toolchain none
 
 ENV PATH="/root/.elan/bin:$PATH"
 
-# Create a project whose Mathlib dependency determines the
-# required Lean toolchain.
+# Create a Lean project using Mathlib's pinned toolchain
 RUN lake +leanprover-community/mathlib4:lean-toolchain new leanverify math
 
 WORKDIR /app/leanverify
 
-# Install exactly the Lean toolchain required by this Mathlib version.
+# Install the exact Lean toolchain required by Mathlib
 RUN elan toolchain install $(cat lean-toolchain)
 RUN elan default $(cat lean-toolchain)
 
-# Download precompiled Mathlib artifacts.
+# Download precompiled Mathlib artifacts
 RUN lake exe cache get
 
-# Fail the image build immediately if the Mathlib artifact is missing.
+# Verify Mathlib was actually installed
 RUN test -f .lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean
 
 WORKDIR /app
@@ -39,4 +38,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-80}"]
