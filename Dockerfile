@@ -10,24 +10,27 @@ RUN apt-get update && \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install elan
+# Install elan without selecting an arbitrary Lean version
 RUN curl https://elan.lean-lang.org/elan-init.sh -sSf | \
     sh -s -- -y --default-toolchain none
 
 ENV PATH="/root/.elan/bin:$PATH"
 
-# Install Lean
-RUN elan toolchain install stable
-RUN elan default stable
-
-# Create a Lean project with Mathlib
-RUN lake new leanverify math
+# Create a project whose Mathlib dependency determines the
+# required Lean toolchain.
+RUN lake +leanprover-community/mathlib4:lean-toolchain new leanverify math
 
 WORKDIR /app/leanverify
 
-# Fetch dependencies and precompiled Mathlib artifacts
-RUN lake update
+# Install exactly the Lean toolchain required by this Mathlib version.
+RUN elan toolchain install $(cat lean-toolchain)
+RUN elan default $(cat lean-toolchain)
+
+# Download precompiled Mathlib artifacts.
 RUN lake exe cache get
+
+# Fail the image build immediately if the Mathlib artifact is missing.
+RUN test -f .lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean
 
 WORKDIR /app
 
