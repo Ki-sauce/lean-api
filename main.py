@@ -4,10 +4,11 @@ import os
 import subprocess
 import threading
 import time
-import urllib.parse
+from pathlib import Path
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+
 
 app = FastAPI()
 
@@ -41,9 +42,11 @@ def lean_env():
 class LeanServer:
     def __init__(self):
         self.process = None
-        self.lock = threading.Lock()
         self.responses = {}
         self.diagnostics = {}
+
+        self.response_condition = threading.Condition()
+        self.write_lock = threading.Lock()
 
         self._start()
 
@@ -77,18 +80,22 @@ class LeanServer:
                     "name": "lean-api",
                     "version": "1.0",
                 },
-                "rootUri": self._uri(LEAN_PROJECT),
-                "capabilities": {},
+                "capabilities": {
+                    "textDocument": {
+                        "publishDiagnostics": {
+                            "relatedInformation": True
+                        }
+                    }
+                },
             },
             timeout=120,
         )
 
         self._notify("initialized", {})
 
-    def _uri(self, path):
-        return "file://" + urllib.parse.quote(
-            os.path.abspath(path)
-        )
+    # ------------------------------------------------------------
+    # LSP transport
+    # ------------------------------------------------------------
 
     def _send(self, message):
         body = json.dumps(
@@ -98,11 +105,13 @@ class LeanServer:
 
         header = (
             f"Content-Length: {len(body)}\r\n"
-            f"\r\n"
+            "\r\n"
         ).encode("ascii")
 
-        self.process.stdin.write(header + body)
-        self.process.stdin.flush()
+        with self.write_lock:
+            self.process.stdin.write(header)
+            self.process.stdin.write(body)
+            self.process.stdin.flush()
 
     def _notify(self, method, params):
         self._send({
@@ -112,68 +121,119 @@ class LeanServer:
         })
 
     def _request(self, request_id, method, params, timeout=120):
-        with self.lock:
-            self._send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            })
+        self._send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        })
 
-            deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
 
-            while time.time() < deadline:
-                if request_id in self.responses:
-                    return self.responses.pop(request_id)
+        with self.response_condition:
+            while request_id not in self.responses:
+                remaining = deadline - time.monotonic()
 
-                time.sleep(0.01)
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Lean server request timed out: {method}"
+                    )
 
-        raise TimeoutError(
-            f"Lean server request timed out: {method}"
-        )
+                self.response_condition.wait(
+                    timeout=remaining
+                )
+
+            return self.responses.pop(request_id)
+
+    # ------------------------------------------------------------
+    # LSP reader
+    # ------------------------------------------------------------
+
+    def _read_message(self):
+        headers = {}
+
+        while True:
+            line = self.process.stdout.readline()
+
+            if not line:
+                return None
+
+            line = line.decode("ascii").rstrip("\r\n")
+
+            if not line:
+                break
+
+            key, value = line.split(":", 1)
+            headers[key.lower()] = value.strip()
+
+        length = int(headers["content-length"])
+
+        body = self.process.stdout.read(length)
+
+        if not body:
+            return None
+
+        return json.loads(body.decode("utf-8"))
 
     def _read_loop(self):
         while True:
             try:
-                headers = {}
+                message = self._read_message()
 
-                while True:
-                    line = self.process.stdout.readline()
-
-                    if not line:
-                        return
-
-                    line = line.decode("ascii").strip()
-
-                    if not line:
-                        break
-
-                    key, value = line.split(":", 1)
-                    headers[key.lower()] = value.strip()
-
-                length = int(headers["content-length"])
-                body = self.process.stdout.read(length)
-
-                if not body:
+                if message is None:
                     return
 
-                message = json.loads(body.decode("utf-8"))
-
+                # Response to one of our requests.
                 if "id" in message and (
-                    "result" in message or "error" in message
+                    "result" in message
+                    or "error" in message
                 ):
-                    self.responses[message["id"]] = message
+                    with self.response_condition:
+                        self.responses[message["id"]] = message
+                        self.response_condition.notify_all()
 
-                elif message.get("method") == "textDocument/publishDiagnostics":
+                    continue
+
+                # Request originating from Lean.
+                #
+                # Lean can ask the client to register capabilities,
+                # refresh things, etc. We don't need those capabilities,
+                # but we must answer the JSON-RPC request.
+                if (
+                    "id" in message
+                    and "method" in message
+                ):
+                    self._send({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": None,
+                    })
+
+                    continue
+
+                # Diagnostics notification.
+                if (
+                    message.get("method")
+                    == "textDocument/publishDiagnostics"
+                ):
                     params = message.get("params", {})
                     uri = params.get("uri")
 
-                    self.diagnostics[uri] = params.get(
+                    diagnostics = params.get(
                         "diagnostics",
                         [],
                     )
 
-            except Exception:
+                    self.diagnostics[uri] = diagnostics
+
+                    continue
+
+            except Exception as e:
+                print(
+                    "[lean-reader]",
+                    repr(e),
+                    flush=True,
+                )
                 return
 
     def _stderr_loop(self):
@@ -189,19 +249,23 @@ class LeanServer:
                 flush=True,
             )
 
+    # ------------------------------------------------------------
+    # Lean checking
+    # ------------------------------------------------------------
+
     def check(self, source):
         filename = os.path.join(
             LEAN_PROJECT,
             f"_check_{time.time_ns()}.lean",
         )
 
-        uri = self._uri(filename)
+        uri = Path(filename).resolve().as_uri()
+
+        version = 1
 
         try:
             with open(filename, "w") as f:
                 f.write(source)
-
-            version = int(time.time_ns() % 2_000_000_000)
 
             self.diagnostics.pop(uri, None)
 
@@ -217,9 +281,9 @@ class LeanServer:
                 },
             )
 
-            request_id = int(time.time_ns() % 2_000_000_000)
+            request_id = time.time_ns()
 
-            result = self._request(
+            self._request(
                 request_id,
                 "textDocument/waitForDiagnostics",
                 {
@@ -229,15 +293,20 @@ class LeanServer:
                 timeout=120,
             )
 
-            diagnostics = self.diagnostics.get(uri, [])
+            diagnostics = self.diagnostics.get(
+                uri,
+                [],
+            )
 
             errors = [
-                d for d in diagnostics
+                d
+                for d in diagnostics
                 if d.get("severity") == 1
             ]
 
             warnings = [
-                d for d in diagnostics
+                d
+                for d in diagnostics
                 if d.get("severity") != 1
             ]
 
@@ -246,7 +315,6 @@ class LeanServer:
                 "diagnostics": diagnostics,
                 "errors": errors,
                 "warnings": warnings,
-                "server_response": result,
             }
 
         finally:
