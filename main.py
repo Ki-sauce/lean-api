@@ -105,7 +105,7 @@ def check(req: CheckRequest):
             env=lean_env(),
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=90,
         )
 
         return {
